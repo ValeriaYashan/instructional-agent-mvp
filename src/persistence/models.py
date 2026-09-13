@@ -20,16 +20,26 @@ CANDIDATE, CR-33 a CR-38):
       adaptador NO semantico - CR-34)
     - context_package (salida inmutable del Paso 9)
 
-Generalizada en Iteracion 2 (CR-29) y ampliada en Iteracion 3 (CR-35,
-mismo patron de migracion compatible hacia atras):
-    - idempotency_operation: operation_type pasa de 2 a 3 valores
-      ('APPROVED_STATE_COMMIT', 'WORKFLOW_TRANSITION',
-      'CONTEXT_ASSEMBLY'). El comportamiento de los dos primeros no
-      cambia.
+Tablas nuevas de Iteracion 4 (Proposal v0.5 HUMAN_APPROVED, CR-47 a
+CR-59):
+    - agent_run (unidad logica de trabajo, con lease + fencing por
+      generacion)
+    - agent_run_attempt (intento tecnico, a lo sumo uno exitoso por
+      logical_run_id, DB-enforced)
+    - object_version_content (payload generado, 1:0..1 con
+      object_version - CR-48, no ArtifactVersion separado)
 
-No se crean en esta iteracion: routing_contract, agent_run,
-agent_run_attempt, human_approval_wait_state. Llegan en iteraciones
-posteriores.
+Generalizada en Iteracion 2 (CR-29), ampliada en Iteracion 3 (CR-35) y
+en Iteracion 4 (CR-51/CR-54, mismo patron de migracion compatible hacia
+atras):
+    - idempotency_operation: operation_type pasa de 3 a 4 valores,
+      agrega 'PRODUCER_EXECUTION' (resuelve hacia agent_run_id, nunca
+      hacia ObjectVersionContent directamente - CR-54). El
+      comportamiento de los tres anteriores no cambia.
+
+CR-57 (Iteracion 4): UNIQUE(object_id, version_number) agregada sobre
+object_version como extension aditiva - OBJECT_VERSION_NUMBER_UNIQUE_PER_OBJECT.
+No modifica el significado ya aprobado de object_version.
 
 Invariantes de integridad relacional heredadas de Iteracion 1 (CR-19,
 CR-20) sin cambios: ver historial de este archivo en iteraciones
@@ -54,9 +64,11 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
+    Index,
     PrimaryKeyConstraint,
     String,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -147,6 +159,12 @@ class ObjectVersion(Base):
     __table_args__ = (
         UniqueConstraint(
             "object_id", "object_version_id", name="uq_object_version_object_id_version_id"
+        ),
+        # CR-57 (Iteracion 4): extension aditiva - OBJECT_VERSION_NUMBER_UNIQUE_PER_OBJECT.
+        # No modifica el significado ya aprobado de object_version (CR-19/CR-20/CR-21
+        # intactos); refuerza una invariante natural que ya se cumplia de hecho.
+        UniqueConstraint(
+            "object_id", "version_number", name="uq_object_version_object_id_version_number"
         ),
         CheckConstraint(
             f"status IN ({_known_states_sql_list})",
@@ -381,9 +399,22 @@ class IdempotencyOperation(Base):
     WORKFLOW_TRANSITION, para permitir replay identico. TASK_TYPE_UNRESOLVED
     es la excepcion: Task Intake lo rechaza ANTES de cualquier acceso a
     base de datos - nunca genera una fila en esta tabla, a diferencia de
-    los tres anteriores (correccion de documentacion, Human Code
-    Review de Iteracion 3; no cambia comportamiento en tiempo de
-    ejecucion, que ya era este desde el build v1).
+    los tres anteriores.
+
+    PRODUCER_EXECUTION (Iteracion 4, Proposal v0.5, CR-51/CR-54): resuelve
+    rapido y de forma durable hacia agent_run_id (nunca hacia
+    ObjectVersionContent directamente) - la reserva de idempotencia
+    identifica QUE logical_run_id corresponde a una solicitud, no si esa
+    ejecucion tuvo exito. Por eso CLAIMED nunca sobrevive fuera de la
+    transaccion corta de Fase A (CR-51): a diferencia de
+    WORKFLOW_TRANSITION/CONTEXT_ASSEMBLY, aqui NO existe una rama
+    PRODUCER_EXECUTION+REJECTED para fallos de ejecucion del Producer
+    (TECHNICAL_FAILURE/INVALID_OUTPUT/CLAIM_LOST/MAX_ATTEMPTS_EXCEEDED
+    viven enteramente en agent_run/agent_run_attempt, nunca aqui) - la
+    unica rama REJECTED de PRODUCER_EXECUTION es INVALID_CONTEXT_PACKAGE,
+    detectado ANTES de crear el AgentRun (mismo patron que
+    INVALID_OBJECT_VERSION/INVALID_CONTEXT_PACKAGE de las iteraciones
+    anteriores).
     """
 
     __tablename__ = "idempotency_operation"
@@ -407,6 +438,11 @@ class IdempotencyOperation(Base):
         ForeignKey("context_package.context_package_id"),
         nullable=True,
     )
+    agent_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("agent_run.logical_run_id"),
+        nullable=True,
+    )
     rejected_reason: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False
@@ -416,7 +452,7 @@ class IdempotencyOperation(Base):
         PrimaryKeyConstraint("operation_type", "idempotency_key", name="idempotency_operation_pkey"),
         CheckConstraint(
             "operation_type IN ('APPROVED_STATE_COMMIT', 'WORKFLOW_TRANSITION', "
-            "'CONTEXT_ASSEMBLY')",
+            "'CONTEXT_ASSEMBLY', 'PRODUCER_EXECUTION')",
             name="ck_idempotency_operation_operation_type",
         ),
         CheckConstraint(
@@ -427,33 +463,47 @@ class IdempotencyOperation(Base):
             "rejected_reason IS NULL OR rejected_reason IN "
             "('UNKNOWN_STATE', 'TRANSITION_NOT_ENABLED_THIS_ITERATION', "
             "'STATE_CONFLICT', 'INVALID_OBJECT_VERSION', "
-            "'TASK_TYPE_UNRESOLVED', 'MAPPING_UNDEFINED', 'NEWER_VERSION_AVAILABLE')",
+            "'TASK_TYPE_UNRESOLVED', 'MAPPING_UNDEFINED', 'NEWER_VERSION_AVAILABLE', "
+            "'INVALID_CONTEXT_PACKAGE')",
             name="ck_idempotency_operation_rejected_reason_canonical",
         ),
-        # CR-30 (Iteracion 2) ampliado con la rama CONTEXT_ASSEMBLY
-        # (Iteracion 3, CR-35): cada operation_type solo puede resolver
-        # en su propia referencia de dominio (commit_id / transition_id /
-        # context_package_id), nunca en mas de una a la vez, y
-        # APPROVED_STATE_COMMIT+REJECTED sigue siendo estructuralmente
-        # imposible.
+        # CR-30 (I2) + CR-35 (I3) + Proposal v0.5 CR-54 (I4): cada
+        # operation_type solo puede resolver en su propia referencia de
+        # dominio, nunca en mas de una a la vez. Las seis ramas
+        # preexistentes quedan TEXTUALMENTE SIN CAMBIO; se agregan dos
+        # ramas nuevas para PRODUCER_EXECUTION.
         CheckConstraint(
             "(status = 'CLAIMED' AND commit_id IS NULL AND transition_id IS NULL "
-            "AND context_package_id IS NULL AND rejected_reason IS NULL) "
+            "AND context_package_id IS NULL AND agent_run_id IS NULL "
+            "AND rejected_reason IS NULL) "
             "OR (operation_type = 'APPROVED_STATE_COMMIT' AND status = 'COMMITTED' "
             "AND commit_id IS NOT NULL AND transition_id IS NULL "
-            "AND context_package_id IS NULL AND rejected_reason IS NULL) "
+            "AND context_package_id IS NULL AND agent_run_id IS NULL "
+            "AND rejected_reason IS NULL) "
             "OR (operation_type = 'WORKFLOW_TRANSITION' AND status = 'COMMITTED' "
             "AND commit_id IS NULL AND transition_id IS NOT NULL "
-            "AND context_package_id IS NULL AND rejected_reason IS NULL) "
+            "AND context_package_id IS NULL AND agent_run_id IS NULL "
+            "AND rejected_reason IS NULL) "
             "OR (operation_type = 'WORKFLOW_TRANSITION' AND status = 'REJECTED' "
             "AND commit_id IS NULL AND transition_id IS NULL "
-            "AND context_package_id IS NULL AND rejected_reason IS NOT NULL) "
+            "AND context_package_id IS NULL AND agent_run_id IS NULL "
+            "AND rejected_reason IS NOT NULL) "
             "OR (operation_type = 'CONTEXT_ASSEMBLY' AND status = 'COMMITTED' "
             "AND commit_id IS NULL AND transition_id IS NULL "
-            "AND context_package_id IS NOT NULL AND rejected_reason IS NULL) "
+            "AND context_package_id IS NOT NULL AND agent_run_id IS NULL "
+            "AND rejected_reason IS NULL) "
             "OR (operation_type = 'CONTEXT_ASSEMBLY' AND status = 'REJECTED' "
             "AND commit_id IS NULL AND transition_id IS NULL "
-            "AND context_package_id IS NULL AND rejected_reason IS NOT NULL)",
+            "AND context_package_id IS NULL AND agent_run_id IS NULL "
+            "AND rejected_reason IS NOT NULL) "
+            "OR (operation_type = 'PRODUCER_EXECUTION' AND status = 'COMMITTED' "
+            "AND commit_id IS NULL AND transition_id IS NULL "
+            "AND context_package_id IS NULL AND agent_run_id IS NOT NULL "
+            "AND rejected_reason IS NULL) "
+            "OR (operation_type = 'PRODUCER_EXECUTION' AND status = 'REJECTED' "
+            "AND commit_id IS NULL AND transition_id IS NULL "
+            "AND context_package_id IS NULL AND agent_run_id IS NULL "
+            "AND rejected_reason IS NOT NULL)",
             name="ck_idempotency_operation_row_invariants",
         ),
     )
@@ -489,4 +539,185 @@ class AuditEvent(Base):
         ForeignKey("context_package.context_package_id"),
         nullable=True,
     )
+    agent_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("agent_run.logical_run_id"),
+        nullable=True,
+    )
     payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
+
+# ---------------------------------------------------------------------------
+# Iteracion 4 (Proposal v0.5, HUMAN_APPROVED) - Producer Execution & Agent Run
+# Lifecycle. CR-47 a CR-59.
+# ---------------------------------------------------------------------------
+
+
+class AgentRun(Base):
+    """
+    Unidad logica de trabajo (Proposal v0.5 S8). role='PRODUCER'
+    unicamente en esta iteracion - 'QA' queda reservado para Iteracion 5
+    sin requerir cambio de schema futuro (producer_logical_run_id ya
+    presente, NULL en I4).
+
+    lease_generation es el TOKEN DE FENCING (CR-56/CR-59): cambia
+    UNICAMENTE en adquisicion inicial o en reclamacion tras vencimiento
+    del lease - NUNCA en un reintento tecnico bajo el mismo dueno
+    (CR-58). La autorizacion de finalizacion (exitosa o por
+    max_attempts) exige ATOMICAMENTE claimed_by + lease_generation +
+    status='IN_PROGRESS' + lease_expires_at > clock_timestamp()
+    (LEASE_IS_VALID, CR-59, corregido por CODE-CR-69 - clock_timestamp()
+    de PostgreSQL, nunca now()/CURRENT_TIMESTAMP ni el reloj de la
+    aplicacion; ver agent_run_manager.py para el fencing adicional
+    contra espera de row lock) en el mismo UPDATE que otorga esa
+    autoridad - nunca en una lectura previa desacoplada de la escritura.
+    """
+
+    __tablename__ = "agent_run"
+
+    logical_run_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    role: Mapped[str] = mapped_column(String, nullable=False)
+    producer_logical_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("agent_run.logical_run_id"),
+        nullable=True,
+    )
+    task_type: Mapped[str] = mapped_column(String, nullable=False)
+    target_object_version_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("object_version.object_version_id"),
+        nullable=False,
+    )
+    context_package_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("context_package.context_package_id"),
+        nullable=False,
+    )
+    requested_by: Mapped[str] = mapped_column(String, nullable=False)
+    correlation_id: Mapped[str] = mapped_column(String, nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="PENDING")
+    claimed_by: Mapped[str | None] = mapped_column(String, nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    lease_generation: Mapped[int] = mapped_column(nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint("role IN ('PRODUCER')", name="ck_agent_run_role_known"),
+        CheckConstraint(
+            "status IN ('PENDING', 'IN_PROGRESS', 'SUCCEEDED', 'FAILED')",
+            name="ck_agent_run_status_known",
+        ),
+        CheckConstraint(
+            "role != 'PRODUCER' OR producer_logical_run_id IS NULL",
+            name="ck_agent_run_producer_has_no_producer_ref",
+        ),
+        # CR-56: a lo sumo un AgentRun ACTIVO por ObjectVersion - indice
+        # unico PARCIAL (solo entre status PENDING/IN_PROGRESS), no una
+        # UniqueConstraint plana (esa impediria para siempre un segundo
+        # AgentRun sobre la misma version, incluso tras SUCCEEDED/FAILED).
+        Index(
+            "uq_agent_run_target_version_active",
+            "target_object_version_id",
+            unique=True,
+            postgresql_where=text("status IN ('PENDING', 'IN_PROGRESS')"),
+        ),
+    )
+
+
+class AgentRunAttempt(Base):
+    """
+    Intento tecnico dentro de un AgentRun (Proposal v0.5 S8). A lo sumo
+    un attempt por logical_run_id puede tener outcome='SUCCESS'
+    (CR-47, UNIQUE parcial). lease_generation_at_creation es el token de
+    fencing capturado en el momento de creacion de este intento (CR-56) -
+    se compara contra agent_run.lease_generation vigente en el momento
+    de finalizacion (S8.7/S8.5), nunca inferido de otra forma.
+    """
+
+    __tablename__ = "agent_run_attempt"
+
+    attempt_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    logical_run_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("agent_run.logical_run_id"),
+        nullable=False,
+    )
+    attempt_number: Mapped[int] = mapped_column(nullable=False)
+    lease_generation_at_creation: Mapped[int] = mapped_column(nullable=False)
+    outcome: Mapped[str | None] = mapped_column(String, nullable=True)
+    failure_detail: Mapped[str | None] = mapped_column(String, nullable=True)
+    provider: Mapped[str | None] = mapped_column(String, nullable=True)
+    model_identifier: Mapped[str | None] = mapped_column(String, nullable=True)
+    instructions_version: Mapped[str | None] = mapped_column(String, nullable=True)
+    output_schema_version: Mapped[str | None] = mapped_column(String, nullable=True)
+    output_payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    token_usage: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    cost_estimate: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "outcome IS NULL OR outcome IN "
+            "('SUCCESS', 'TECHNICAL_FAILURE', 'INVALID_OUTPUT', 'CLAIM_LOST')",
+            name="ck_agent_run_attempt_outcome_known",
+        ),
+        UniqueConstraint(
+            "logical_run_id", "attempt_number", name="uq_agent_run_attempt_logical_run_number"
+        ),
+        # CR-47: a lo sumo un intento exitoso por logical_run_id - indice
+        # unico PARCIAL (WHERE outcome='SUCCESS'), forzado por PostgreSQL,
+        # no solo por disciplina de aplicacion.
+        Index(
+            "uq_agent_run_attempt_logical_run_success",
+            "logical_run_id",
+            unique=True,
+            postgresql_where=text("outcome = 'SUCCESS'"),
+        ),
+    )
+
+
+class ObjectVersionContent(Base):
+    """
+    Payload de contenido generado, 1:0..1 con ObjectVersion (CR-48:
+    ArtifactVersion separado RECHAZADO - el contenido es el payload de
+    la version existente, no una segunda dimension de versionado). Solo
+    existe una vez que Structural Validation (CR-53) tuvo exito - nunca
+    para un intento INVALID_OUTPUT/TECHNICAL_FAILURE.
+    """
+
+    __tablename__ = "object_version_content"
+
+    object_version_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("object_version.object_version_id"),
+        primary_key=True,
+    )
+    schema_version: Mapped[str] = mapped_column(String, nullable=False)
+    title: Mapped[str] = mapped_column(String, nullable=False)
+    body: Mapped[str] = mapped_column(String, nullable=False)
+    learning_outcome_refs: Mapped[list] = mapped_column(JSONB, nullable=False)
+    metadata_: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False)
+    produced_by_attempt_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("agent_run_attempt.attempt_id"),
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )

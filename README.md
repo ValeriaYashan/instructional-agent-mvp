@@ -31,13 +31,10 @@ Documentos autoritativos:
   (CR-33) — `object_type` es invariante de esta identidad, no de una
   versión particular. `object_version.object_id` es ahora FK hacia
   esta tabla, sin cambiar el significado ya aprobado de `object_version`.
-- **Trigger de compatibilidad** (`ensure_instructional_object_exists`):
-  auto-provisiona la fila de `instructional_object` (con
-  `object_type=NULL`) antes de cada INSERT en `object_version` cuando
-  no existe todavía — necesario porque el código de prueba de
-  Iteraciones 1-2 inserta `ObjectVersion` directamente sin pasar por
-  ningún repositorio, y esos tests debían permanecer sin modificar.
-  Documentado como desviación explícita respecto a la Proposal v0.3.
+  Todo `object_id` nuevo requiere su `InstructionalObject` creado
+  explícitamente antes de cualquier `ObjectVersion` que lo referencie —
+  no existe ningún trigger ni mecanismo de auto-provisionamiento
+  permanente (`CODE-CR-42`).
 - **`object_relation`** / **`evidence_source`**: adaptadores mínimos y
   explícitamente no semánticos para los Pasos 3/6 y 7 del Context Engine.
 - **`context_package`**: salida inmutable del Paso 9, con
@@ -208,25 +205,138 @@ documentado en el docstring de `src/persistence/repositories/approved_state.py`.
 - El modelo de `audit_event` es minimo (ver docstring en
   `src/persistence/models.py`), no el modelo completo de Audit Trail
   de Fase 3 (`correlation_id`, `causation_id`, `actor_type`, `run_id`).
-- **Los tests nuevos de Iteración 3 (`tests/unit/test_context_package_hash.py`,
-  `tests/integration/test_context_engine.py`) no han sido ejecutados
-  contra un PostgreSQL real en el entorno donde se generó este build**,
-  por la misma razón que en Iteraciones 1 y 2: sin Docker disponible.
-  Los 7 tests unitarios de hash SÍ corrieron realmente en este entorno
-  (no requieren base de datos) y pasaron. Los 11 tests de integración
-  del Context Engine se verificaron estáticamente (recolección junto
-  con los 31 tests de Iteraciones 1-2 — 42 en total —, compilación de
-  todo el DDL nuevo y de las sentencias SQL críticas). La suite
-  completa, incluida la regresión de Iteraciones 1-2 contra el esquema
-  post-`0003`, debe correrse en una máquina o CI con Docker antes de
-  dar por cerrada la Iteración 3. Comando exacto: `uv run pytest -v`.
+- Los 63 tests (11 unitarios + 52 de integración) de Iteración 3 fueron
+  ejecutados realmente contra PostgreSQL 16 en GitHub Codespaces y
+  pasaron (`63 passed, 1 warning`). Único warning no bloqueante:
+  deprecación de `path_separator` de Alembic.
+- **`CODE-CR-45`**: se corrigió un problema de materialización de la
+  fila padre de `ContextPackage` — se agregó `session.flush()`
+  inmediatamente después de `session.add(ContextPackage(...))`, antes
+  de que `AuditEvent`/`IdempotencyOperation` la referenciaran en la
+  misma transacción. El `flush()` no hace commit; la atomicidad se
+  preserva.
+- **`CODE-CR-46`**: se corrigió la garantía real de `REPEATABLE READ`
+  (CR-37) — `session.connection(execution_options={"isolation_level":
+  "REPEATABLE READ"})` no tenía efecto si la conexión ya tenía una
+  transacción establecida (`SAWarning`). Se reemplazó por
+  `session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE
+  READ"))` como primer statement real de cada intento, con una guarda
+  explícita (`session.in_transaction()`) que exige una `Session` sin
+  transacción activa. Se agregó un test de integración que verifica
+  `SHOW transaction_isolation` desde dentro de los Pasos del Context
+  Engine.
+- **Iteración 3 quedó `HUMAN_APPROVED_CLOSED`** tras esa verificación.
 - Alcance reducido documentado explícitamente (Iteration 3 Proposal
   v0.3, no oculto): `DependencyResolver`/`EvidenceRetriever` resuelven
   contra `object_relation`/`evidence_source` poblados manualmente —
   no importan el grafo completo de Gates 5-7 ni usan retrieval
   semántico (pgvector), ambos diferidos a una iteración futura.
-- `APPROVAL_INSUFFICIENT` (Paso 5) no se ejercita en este alcance:
-  todo objeto resuelto vía `approved_state_pointer` es, por
-  construcción de Iteración 1, `APPROVED_CONTENT` — no hay ninguna
-  tarea en el mapeo de esta iteración que acepte `QA_PASS_PROVISIONAL`
-  como suficiente.
+- `APPROVAL_INSUFFICIENT` (Paso 5) no se ejercita en el alcance de
+  Context Engine: todo objeto resuelto vía `approved_state_pointer` es,
+  por construcción de Iteración 1, `APPROVED_CONTENT`. Sí se ejercita
+  en Iteración 4 para `pinned_version_id` con status insuficiente (ver
+  más abajo).
+
+## Iteracion 4 — Producer Execution & Agent Run Lifecycle
+
+Implementa el vertical slice desde `ContextPackage` hasta contenido
+generado, validado estructuralmente y persistido, con Agent Run
+lifecycle real y protegido contra condiciones de carrera — sin QA
+independiente, sin Routing, sin Human Approval, sin invocar Approved
+State Commit. Diseño completo en `MVP IMPLEMENTATION — ITERATION 4:
+PRODUCER EXECUTION & AGENT RUN LIFECYCLE — PROPOSAL v0.5 — FINAL
+BASELINE CANDIDATE` (`HUMAN_APPROVED`, CR-47 a CR-59).
+
+- **`agent_run` / `agent_run_attempt`**: unidad lógica de trabajo con
+  *lease* y *fencing* por `lease_generation` (CR-56, CR-59). A lo sumo
+  un intento exitoso por `logical_run_id`, forzado por índice único
+  parcial de PostgreSQL (CR-47). Reintento técnico bajo *ownership*
+  vigente sin incrementar `lease_generation` (CR-58); reclamación tras
+  vencimiento sí la incrementa. Autorización de finalización exige
+  atómicamente `claimed_by` + `lease_generation` + `status` +
+  `lease_expires_at > clock_timestamp()` en el mismo `UPDATE` (CR-59,
+  corregido por CODE-CR-69) — un worker con *lease* vencido nunca puede
+  finalizar, aunque nadie lo haya reclamado todavía. La autoridad
+  temporal es exclusivamente el reloj de PostgreSQL
+  (`clock_timestamp()`, nunca `now()`/`CURRENT_TIMESTAMP` ni el reloj
+  de la aplicación) — y, para `authorize_terminal_success`/
+  `mark_failed_if_owner`/`refresh_lease_for_same_owner_retry`, precedida
+  por un `SELECT ... FOR UPDATE` explícito que fuerza cualquier espera
+  de *row lock* a resolverse antes de evaluar la vigencia (CODE-CR-69).
+- **`object_version_content`**: payload de contenido generado, 1:0..1
+  con `ObjectVersion` existente — no se introdujo `ArtifactVersion`
+  como entidad separada (CR-48, rechazado explícitamente).
+- **`Version Creation`**: serializada por `object_id` vía
+  `SELECT ... FOR UPDATE` sobre `InstructionalObject` (CR-57).
+  `UNIQUE(object_id, version_number)` agregada como extensión aditiva.
+- **`Workflow Transition Manager`**: extendido con
+  `apply_transition_in_transaction`, sin `commit()` propio, reutilizada
+  por el Orchestrator dentro de su transacción atómica de Fase C
+  (CR-55). `request_workflow_transition` (API pública de Iteración 2)
+  preservada con backward compatibility total.
+- **`idempotency_operation`**: cuarto `operation_type`,
+  `PRODUCER_EXECUTION`, resuelve hacia `agent_run_id` — nunca hacia el
+  contenido directamente (CR-54). Las invariantes de los tres tipos
+  anteriores quedan sin modificación.
+- **`ProducerExecutor`**: interfaz provider-neutral, con adaptador
+  `FakeProducerAdapter` (tests) y `AnthropicProducerAdapter` (no
+  ejercitado sin credenciales reales en este build).
+- Migración `0004`, compatible hacia atrás, con guardas de downgrade.
+- Build v1: 25 tests unitarios ejecutados realmente (`25 passed`); 66
+  tests de integración recolectados sin errores de import.
+- **Build v2 — correcciones de Human Code Review**:
+  - **`CODE-CR-60`**: el Producer recibía un `dict` vacío en vez del
+    `ContextPackage` real. Se corrigió materializando el
+    `ContextPackage` inmutable correspondiente a
+    `agent_run.context_package_id` una sola vez por ejecución de
+    Fase B, antes del bucle de intentos, y reutilizándolo idéntico en
+    cada llamada al proveedor. `execution_contract.context_package_hash`
+    ahora se puebla con el hash realmente persistido.
+  - **`CODE-CR-61`**: existía una transacción PostgreSQL abierta
+    (`autobegin` de SQLAlchemy 2.x) durante la primera llamada al
+    proveedor. Se corrigió cerrando explícitamente (`rollback()`) cada
+    lectura previa a la construcción del `execution_contract`, más una
+    guarda `_ensure_no_open_transaction()` verificada en runtime
+    inmediatamente antes de cada llamada a `ProducerExecutor.execute()`.
+  - **`CODE-CR-62`**: `AnthropicProducerAdapter._build_prompt`/
+    `_extract_structured_output` implementados de forma real y
+    determinística (antes levantaban `NotImplementedError`), testeables
+    mediante *client injection* sin credenciales ni red real.
+    `agent_run_manager.create_attempt` ahora persiste
+    `provider`/`model_identifier`/`instructions_version`/
+    `output_schema_version` en el momento de creación de cada intento.
+  - Build v2: 33 tests unitarios ejecutados realmente (`33 passed`); 71
+    tests de integración recolectados sin errores de import — no
+    ejecutados contra PostgreSQL real en el entorno donde se generó
+    este build (sin Docker disponible).
+- **Build v3 — correcciones de Human Code Review**:
+  - **`CODE-CR-63`**: `context_package_id` y `max_attempts` se pasaban
+    a Fase B desde variables locales de la solicitud actual, en vez de
+    desde `AgentRun` (la única autoridad para un `logical_run` ya
+    creado). Se corrigió leyendo, en una transacción corta y cerrada,
+    el snapshot completo (`target_object_version_id`,
+    `context_package_id`, `max_attempts`) directamente desde la fila
+    `AgentRun` inmediatamente después de resolver `logical_run_id` en
+    Fase A — antes de invocar Fase B, en ambas ramas (creación nueva o
+    *replay*).
+  - **`CODE-CR-64`**: `reclaim()` ahora cierra atómicamente, dentro de
+    la misma operación condicional, cualquier `AgentRunAttempt` que
+    haya quedado abierto (`outcome IS NULL`) del *worker* anterior
+    desaparecido, marcándolo `CLAIM_LOST` con `finished_at` — nunca
+    queda un intento histórico sin cerrar.
+  - **`CODE-CR-65`**: el prompt del `AnthropicProducerAdapter` ahora
+    declara explícitamente el contrato de salida completo (los cinco
+    campos exactos, el `object_type` autoritativo real —no solo el
+    nombre del schema—, la lista cerrada de referencias permitidas, la
+    prohibición de campos adicionales y de *markdown fences*). Se
+    agregó `ExecutionContract.expected_object_type` como metadata de
+    ejecución provider-neutral, sin modificar el `ContextPackage`
+    persistido.
+  - Cobertura de aceptación ampliada: rollback total de Fase C ante
+    fallo de transición o de auditoría, concurrencia real de
+    reclamaciones y de creación de versión con `idempotency_key`
+    distintas.
+  - Build v3: 34 tests unitarios ejecutados realmente (`34 passed`); 78
+    tests de integración recolectados sin errores de import — no
+    ejecutados contra PostgreSQL real en este entorno (sin Docker).
+    Ningún cambio de esquema respecto a `0004`.

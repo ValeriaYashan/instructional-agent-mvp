@@ -54,6 +54,7 @@ def _clean_tables(_migrated_engine):
         conn.execute(
             text(
                 "TRUNCATE TABLE audit_event, idempotency_operation, "
+                "object_version_content, agent_run_attempt, agent_run, "
                 "context_package, evidence_source, object_relation, "
                 "workflow_transition, approved_state_commit, "
                 "approved_state_pointer, object_version, "

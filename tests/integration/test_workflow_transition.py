@@ -5,7 +5,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import sessionmaker
 
 from src.domain.transition_result import TransitionOutcome
@@ -23,13 +23,35 @@ def _ensure_instructional_object(session, object_id: str) -> None:
 
 
 def _create_object_version(session, object_id: str, status: str) -> uuid.UUID:
+    """
+    CODE-CR-73 (Human Code Review de Build v5) - correccion de TEST,
+    no de produccion: Iteracion 4 introdujo UNIQUE(object_id,
+    version_number) (CR-57, preservada sin cambios). Un test que crea
+    mas de una version del MISMO object_id (para simular una
+    transicion posterior sobre una segunda version, ej.
+    test_no_claimed_row_survives_any_workflow_transition_path) necesita
+    un version_number DISTINTO por cada llamada para ese object_id, o
+    PostgreSQL rechaza el INSERT con UniqueViolation - version_number
+    ya no se hardcodea a 1. Se asigna el siguiente disponible
+    (MAX(version_number)+1, o 1 si es la primera version de ese
+    object_id) - mismo patron ya usado en produccion para
+    AgentRunAttempt.attempt_number
+    (agent_run_manager.next_attempt_number). El resto de las llamadas
+    en este archivo usa object_id distintos entre si y no se ve
+    afectado (UNIQUE es por object_id, no global).
+    """
     _ensure_instructional_object(session, object_id)
+    current_max = session.execute(
+        select(func.coalesce(func.max(ObjectVersion.version_number), 0)).where(
+            ObjectVersion.object_id == object_id
+        )
+    ).scalar_one()
     version_id = uuid.uuid4()
     session.add(
         ObjectVersion(
             object_version_id=version_id,
             object_id=object_id,
-            version_number=1,
+            version_number=current_max + 1,
             status=status,
         )
     )

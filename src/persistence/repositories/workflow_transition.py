@@ -123,6 +123,101 @@ def compute_transition_payload_hash(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def apply_transition_in_transaction(
+    session: Session,
+    target_object_id: str,
+    target_object_version_id: uuid.UUID,
+    from_state: str,
+    to_state: str,
+    requested_by: str,
+    correlation_id: str,
+    idempotency_key: str,
+    payload_hash: str,
+) -> TransitionResult:
+    """
+    Operacion TRANSACTION-SCOPED del Workflow/State Transition Manager
+    (Proposal v0.5, CR-55). Contiene TODA la logica de dominio de una
+    transicion - validacion de pertenencia de la version, validacion de
+    vocabulario, validacion de habilitacion, la mutacion optimista
+    condicional de object_version.status, y la insercion de
+    workflow_transition - pero NUNCA ejecuta session.commit() ni
+    session.rollback(). El llamador decide el limite transaccional.
+
+    Dos llamadores autorizados:
+      - request_workflow_transition (abajo) - wrapper historico de
+        Iteracion 2, que SI hace su propio commit, preservando
+        backward compatibility total.
+      - El Orchestrator de Iteracion 4 (Fase C), que la invoca dentro
+        de su propia transaccion atomica externa y decide UN SOLO
+        commit al final de toda la Fase C - sin duplicar ni
+        reimplementar esta logica en ningun otro lugar
+        (ONLY_WORKFLOW_MANAGER_OWNS_OBJECT_LIFECYCLE_TRANSITIONS).
+
+    Esta funcion NO toca idempotency_operation - esa es responsabilidad
+    exclusiva de cada llamador (request_workflow_transition finaliza su
+    propia reserva WORKFLOW_TRANSITION; el Orchestrator de I4 no la usa
+    en este camino, ver Proposal v0.5 S7).
+    """
+    # Paso 1 (CR-26, CR-28): target_object_version_id pertenece a
+    # target_object_id.
+    version_exists = session.execute(
+        select(ObjectVersion.object_version_id).where(
+            ObjectVersion.object_version_id == target_object_version_id,
+            ObjectVersion.object_id == target_object_id,
+        )
+    ).scalar_one_or_none()
+
+    if version_exists is None:
+        return TransitionResult(outcome=TransitionOutcome.INVALID_OBJECT_VERSION)
+
+    # Paso 2 (CR-21): from_state y to_state pertenecen al vocabulario
+    # completo del lifecycle.
+    if from_state not in KNOWN_STATES or to_state not in KNOWN_STATES:
+        return TransitionResult(outcome=TransitionOutcome.UNKNOWN_STATE)
+
+    # Paso 3 (CR-22): la transicion especifica esta habilitada en esta
+    # iteracion.
+    if (from_state, to_state) not in ENABLED_TRANSITIONS_ITERATION_2:
+        return TransitionResult(outcome=TransitionOutcome.TRANSITION_NOT_ENABLED_THIS_ITERATION)
+
+    # Paso 4 (CR-23): concurrencia optimista explicita.
+    update_result = session.execute(
+        update(ObjectVersion)
+        .where(ObjectVersion.object_version_id == target_object_version_id)
+        .where(ObjectVersion.status == from_state)
+        .values(status=to_state)
+    )
+
+    if update_result.rowcount == 0:
+        return TransitionResult(outcome=TransitionOutcome.STATE_CONFLICT)
+
+    # Paso 5: insertar workflow_transition - la mutacion de estado y
+    # esta insercion son atomicas dentro de la transaccion del llamador
+    # (CR-23).
+    transition_id = uuid.uuid4()
+    session.add(
+        WorkflowTransition(
+            transition_id=transition_id,
+            object_version_id=target_object_version_id,
+            from_state=from_state,
+            to_state=to_state,
+            idempotency_key=idempotency_key,
+            idempotency_payload_hash=payload_hash,
+            requested_by=requested_by,
+            correlation_id=correlation_id,
+            causation_id=None,  # CR-24: diferido
+        )
+    )
+
+    return TransitionResult(
+        outcome=TransitionOutcome.COMMITTED,
+        transition_id=transition_id,
+        object_version_id=target_object_version_id,
+        from_state=from_state,
+        to_state=to_state,
+    )
+
+
 def request_workflow_transition(
     session: Session,
     task_type: str,
@@ -135,8 +230,13 @@ def request_workflow_transition(
     correlation_id: Optional[str] = None,
 ) -> TransitionResult:
     """
-    Punto de entrada unico de Task Intake + Workflow/State Transition
-    Manager para este slice.
+    Punto de entrada publico historico de Iteracion 2 - preservado con
+    backward compatibility TOTAL tras la extraccion de
+    apply_transition_in_transaction (CR-55, Proposal v0.5 S7): misma
+    firma, mismo comportamiento externo observable, mismo commit
+    implicito. Internamente ahora delega toda la logica de dominio a
+    apply_transition_in_transaction y solo administra la reserva de
+    idempotencia WORKFLOW_TRANSITION + el limite transaccional propio.
     """
     # Task Intake: se rechaza ANTES de tocar cualquier tabla, incluida
     # idempotency_operation - un task_type invalido no es un intento de
@@ -162,6 +262,8 @@ def request_workflow_transition(
                 status="CLAIMED",
                 commit_id=None,
                 transition_id=None,
+                context_package_id=None,
+                agent_run_id=None,
                 rejected_reason=None,
             )
             .on_conflict_do_nothing(index_elements=["operation_type", "idempotency_key"])
@@ -169,7 +271,7 @@ def request_workflow_transition(
         ).scalar_one_or_none()
 
         if reservation_won is not None:
-            return _proceed_as_owner(
+            result = apply_transition_in_transaction(
                 session=session,
                 target_object_id=target_object_id,
                 target_object_version_id=target_object_version_id,
@@ -180,6 +282,31 @@ def request_workflow_transition(
                 idempotency_key=idempotency_key,
                 payload_hash=payload_hash,
             )
+            if result.outcome == TransitionOutcome.COMMITTED:
+                session.execute(
+                    update(IdempotencyOperation)
+                    .where(
+                        IdempotencyOperation.operation_type == _OPERATION_TYPE,
+                        IdempotencyOperation.idempotency_key == idempotency_key,
+                    )
+                    .values(status="COMMITTED", transition_id=result.transition_id)
+                )
+                session.commit()
+                return result
+            else:
+                # CR-27: un resultado rechazado PERSISTE via COMMIT
+                # explicito (nunca ROLLBACK), para permitir replay
+                # identico.
+                session.execute(
+                    update(IdempotencyOperation)
+                    .where(
+                        IdempotencyOperation.operation_type == _OPERATION_TYPE,
+                        IdempotencyOperation.idempotency_key == idempotency_key,
+                    )
+                    .values(status="REJECTED", rejected_reason=result.outcome.value)
+                )
+                session.commit()
+                return result
 
         # La key ya existe (confirmada - COMMITTED o REJECTED, nunca
         # CLAIMED de forma durable, ver docstring de IdempotencyOperation).
@@ -230,111 +357,3 @@ def _replay_result(session: Session, existing: IdempotencyOperation) -> Transiti
 
     # status == 'REJECTED' (unico otro valor final posible - CR-30)
     return TransitionResult(outcome=TransitionOutcome(existing.rejected_reason))
-
-
-def _reject(
-    session: Session,
-    idempotency_key: str,
-    reason: TransitionOutcome,
-) -> TransitionResult:
-    """
-    CR-27: un resultado rechazado de Workflow Transition PERSISTE via
-    COMMIT explicito (nunca ROLLBACK), para permitir replay identico.
-    Diferencia deliberada respecto a Approved State Commit (Iteracion 1),
-    donde STATE_CONFLICT si hace ROLLBACK ALL - ese contrato no se toca.
-    """
-    session.execute(
-        update(IdempotencyOperation)
-        .where(
-            IdempotencyOperation.operation_type == _OPERATION_TYPE,
-            IdempotencyOperation.idempotency_key == idempotency_key,
-        )
-        .values(status="REJECTED", rejected_reason=reason.value)
-    )
-    session.commit()
-    return TransitionResult(outcome=reason)
-
-
-def _proceed_as_owner(
-    session: Session,
-    target_object_id: str,
-    target_object_version_id: uuid.UUID,
-    from_state: str,
-    to_state: str,
-    requested_by: str,
-    correlation_id: str,
-    idempotency_key: str,
-    payload_hash: str,
-) -> TransitionResult:
-    # Paso 1 (CR-26, CR-28): target_object_version_id pertenece a
-    # target_object_id.
-    version_exists = session.execute(
-        select(ObjectVersion.object_version_id).where(
-            ObjectVersion.object_version_id == target_object_version_id,
-            ObjectVersion.object_id == target_object_id,
-        )
-    ).scalar_one_or_none()
-
-    if version_exists is None:
-        return _reject(session, idempotency_key, TransitionOutcome.INVALID_OBJECT_VERSION)
-
-    # Paso 2 (CR-21): from_state y to_state pertenecen al vocabulario
-    # completo del lifecycle.
-    if from_state not in KNOWN_STATES or to_state not in KNOWN_STATES:
-        return _reject(session, idempotency_key, TransitionOutcome.UNKNOWN_STATE)
-
-    # Paso 3 (CR-22): la transicion especifica esta habilitada en esta
-    # iteracion - no se simula ejecucion de componentes fuera de alcance.
-    if (from_state, to_state) not in ENABLED_TRANSITIONS_ITERATION_2:
-        return _reject(
-            session, idempotency_key, TransitionOutcome.TRANSITION_NOT_ENABLED_THIS_ITERATION
-        )
-
-    # Paso 4 (CR-23): concurrencia optimista explicita.
-    update_result = session.execute(
-        update(ObjectVersion)
-        .where(ObjectVersion.object_version_id == target_object_version_id)
-        .where(ObjectVersion.status == from_state)
-        .values(status=to_state)
-    )
-
-    if update_result.rowcount == 0:
-        return _reject(session, idempotency_key, TransitionOutcome.STATE_CONFLICT)
-
-    # Paso 5: insertar workflow_transition (transicion EFECTIVAMENTE
-    # aplicada) - la mutacion de estado y esta insercion son atomicas
-    # (CR-23).
-    transition_id = uuid.uuid4()
-    session.add(
-        WorkflowTransition(
-            transition_id=transition_id,
-            object_version_id=target_object_version_id,
-            from_state=from_state,
-            to_state=to_state,
-            idempotency_key=idempotency_key,
-            idempotency_payload_hash=payload_hash,
-            requested_by=requested_by,
-            correlation_id=correlation_id,
-            causation_id=None,  # CR-24: diferido, ver docstring del modulo
-        )
-    )
-
-    # Paso 6: finalizar la reserva de idempotencia en la MISMA transaccion.
-    session.execute(
-        update(IdempotencyOperation)
-        .where(
-            IdempotencyOperation.operation_type == _OPERATION_TYPE,
-            IdempotencyOperation.idempotency_key == idempotency_key,
-        )
-        .values(status="COMMITTED", transition_id=transition_id)
-    )
-
-    session.commit()
-
-    return TransitionResult(
-        outcome=TransitionOutcome.COMMITTED,
-        transition_id=transition_id,
-        object_version_id=target_object_version_id,
-        from_state=from_state,
-        to_state=to_state,
-    )
